@@ -39,6 +39,11 @@ thread_local! {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn grpc_client_version() -> *const c_char {
+  CString::new(env!("CARGO_PKG_VERSION")).unwrap().into_raw()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn grpc_client_streaming_request_new(
   client_handle: grpc_client_handle,
   service: ffi_support::FfiStr,
@@ -150,12 +155,12 @@ pub extern "C" fn grpc_client_new(
         .insert(client::GrpcClient {
           descriptors: HashMap::new(),
           read_buf: Rc::new(RefCell::new(Vec::new())),
-          write_buf: Rc::new(RefCell::new(Vec::new())),
           waker: Rc::new(RefCell::new(None)),
           reactor: runtime::Reactor::new(),
           h2_sender: Rc::new(RefCell::new(None)),
           authority,
           scheme,
+          on_socket_write_cb: None,
         })
         .into_u64()
     }))
@@ -168,6 +173,21 @@ pub extern "C" fn grpc_client_free(handle: grpc_client_handle, err: &mut grpc_cl
     let handle = ffi_support::Handle::from_u64(handle)?;
     GRPC_CLIENT_HANDLES.with(|m| m.borrow_mut().delete(handle))
   });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn grpc_client_set_on_socket_write_cb(
+  handle: grpc_client_handle,
+  on_socket_write_cb: grpc_client_on_reply,
+  err: &mut grpc_client_error,
+) {
+  ffi_support::call_with_result(err, || {
+    let handle = ffi_support::Handle::from_u64(handle)?;
+    GRPC_CLIENT_HANDLES.with(|m| -> Result<(), grpc_client_error> {
+      m.borrow_mut().get_mut(handle)?.on_socket_write_cb = Some(on_socket_write_cb);
+      Ok(())
+    })
+  })
 }
 
 #[unsafe(no_mangle)]
@@ -250,13 +270,25 @@ pub extern "C" fn grpc_client_connect(handle: grpc_client_handle, err: &mut grpc
       let mut client_ref = m.borrow_mut();
       let client = client_ref.get_mut(handle)?;
       let read_buf = client.read_buf.clone();
-      let write_buf = client.write_buf.clone();
       let waker = client.waker.clone();
       let reactor_for_spawn = client.reactor.clone();
       let reactor_for_drive = reactor_for_spawn.clone();
       let sender_cell = client.h2_sender.clone();
-      client.reactor.spawn(async move {
-        let io = transport::memory_shim::MemoryShim::new(read_buf, write_buf, waker);
+      let on_socket_write_cb = client.on_socket_write_cb;
+
+      if on_socket_write_cb.is_none() {
+        return Err(grpc_client_error::new_error(
+          ffi_support::ErrorCode::new(1),
+          "on_socket_write_cb is not set",
+        ));
+      }
+
+      reactor_for_spawn.spawn(async move {
+        let io = transport::memory_shim::MemoryShim {
+          read_buf,
+          waker,
+          on_socket_write_cb: on_socket_write_cb.unwrap(),
+        };
         match h2::client::handshake(io).await {
           Ok((send_request, connection)) => {
             log::debug!("h2 handshake OK; storing sender");
@@ -323,36 +355,6 @@ pub extern "C" fn grpc_client_drive_once(
       let client = client_ref.get_mut(handle)?;
       client.reactor.poke_all();
       Ok(client.reactor.drive_once(64))
-    })
-  })
-}
-
-/// Read pending bytes from Rust buffer and consume them
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_peek_write(
-  handle: grpc_client_handle,
-  out: *mut c_char,
-  max_len: u32,
-  err: &mut grpc_client_error,
-) -> u32 {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    GRPC_CLIENT_HANDLES.with(|m| -> Result<u32, grpc_client_error> {
-      let client_ref = m.borrow();
-      let client = client_ref.get(handle)?;
-      let mut wb = client.write_buf.borrow_mut();
-      let n = std::cmp::min(max_len as usize, wb.len());
-      if n == 0 {
-        return Ok(0);
-      }
-      unsafe {
-        std::ptr::copy_nonoverlapping(wb.as_ptr(), out as *mut u8, n);
-      }
-
-      // Consume the bytes directly
-      wb.drain(0..n);
-      Ok(n as u32)
     })
   })
 }

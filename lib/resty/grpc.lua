@@ -11,6 +11,7 @@ local tcp          = ngx.socket.tcp
 local is_exiting   = ngx.worker.exiting
 local table_new    = resty_base.new_tab
 local table_insert = table.insert
+local table_remove = table.remove
 local json_encode  = cjson.encode
 local json_decode  = cjson.decode
 
@@ -19,6 +20,7 @@ ffi.cdef [[
   typedef void *grpc_client;
   typedef void (*grpc_client_on_done)();
   typedef void (*grpc_client_on_reply)(const char*, uintptr_t);
+  typedef void (*grpc_client_on_socket_write)(const char*, uintptr_t);
 
   void grpc_client_loaded_protos(grpc_client handle);
 
@@ -30,14 +32,16 @@ ffi.cdef [[
   typedef uint64_t grpc_client_handle;
   typedef uint64_t grpc_client_streaming_request_handle;
 
+  char* grpc_client_version();
+
   grpc_client_handle grpc_client_new(const char* authority, const char* scheme, grpc_client_error *err);
   void grpc_client_free(grpc_client_handle handle, grpc_client_error *err);
+  void grpc_client_set_on_socket_write_cb(grpc_client_handle handle, grpc_client_on_socket_write on_socket_write_cb, grpc_client_error *err);
 
   void grpc_client_load_proto_file(grpc_client_handle handle, const char* proto_path, grpc_client_error *err);
   void grpc_client_connect(grpc_client_handle handle, grpc_client_error *err);
   void grpc_client_on_receive(grpc_client_handle handle, const char *data, uintptr_t n, grpc_client_error *err);
   uint8_t grpc_client_drive_once(grpc_client_handle handle, grpc_client_error *err);
-  uint32_t grpc_client_peek_write(grpc_client_handle handle, char *out, uint32_t max_len, grpc_client_error *err);
 
   // unary
   void grpc_client_unary(grpc_client_handle handle,
@@ -112,13 +116,14 @@ if not C then
   error(table.concat(tried_paths, '\r\n', 1, #tried_paths))
 end
 
+local grpc_client_version                = C.grpc_client_version
 local grpc_client_new                    = C.grpc_client_new
 local grpc_client_free                   = C.grpc_client_free
+local grpc_client_set_on_socket_write_cb = C.grpc_client_set_on_socket_write_cb
 local grpc_client_load_proto_file        = C.grpc_client_load_proto_file
 local grpc_client_connect                = C.grpc_client_connect
 local grpc_client_on_receive             = C.grpc_client_on_receive
 local grpc_client_drive_once             = C.grpc_client_drive_once
-local grpc_client_peek_write             = C.grpc_client_peek_write
 local grpc_client_unary                  = C.grpc_client_unary
 local grpc_client_server_streaming       = C.grpc_client_server_streaming
 local grpc_client_streaming_request_new  = C.grpc_client_streaming_request_new
@@ -149,7 +154,7 @@ local function setmetatable(t, mt)
   return orig_setmetatable(t, mt)
 end
 
-local _M = { _VERSION = '0.1.0' }
+local _M = { _VERSION = '0.1.0 (' .. ffi_str(grpc_client_version()) .. ')' }
 
 function _M.new(opts)
   -- create grpc client
@@ -188,6 +193,33 @@ function _M.new(opts)
     end
   end
 
+  -- set on_socket_write callback
+  ffi_call(grpc_client_set_on_socket_write_cb, cli.grpc_client,
+    ffi_cast("grpc_client_on_socket_write", function(ptr, n)
+      local bytes_send = 0
+      local data = ffi_str(ptr, n)
+      while not is_exiting() do
+        if cli.closed then
+          break
+        end
+
+        local sent, err = sock:send(data:sub(bytes_send + 1))
+        if not sent and err == "closed" then
+          ngx.log(ngx.ERR, "failed to send data: ", err)
+          cli.closed = true
+          return
+        end
+
+        bytes_send = bytes_send + sent
+        if bytes_send >= n then
+          break
+        else
+          ngx.log(ngx.ERR, "partial send in on_socket_write callback: ", bytes_send, " of ", n)
+        end
+      end
+    end)
+  )
+
   -- load pre-defined proto files
   for _, path in ipairs(opts.protos) do
     local _, err = ffi_call(grpc_client_load_proto_file, cli.grpc_client, path)
@@ -205,50 +237,7 @@ function _M.new(opts)
   -- drive once to produce initial bytes to be sent
   ffi_call(grpc_client_drive_once, cli.grpc_client)
 
-  -- start event loop
-  cli.write_evloop = ngx.thread.spawn(function()
-    while not is_exiting() do
-      if cli.closed then
-        break
-      end
-
-      -- take pending bytes from Rust-side buffer
-      -- TODO: use cdata ptr directly to avoid copy
-      local buf = ffi_new("uint8_t[?]", 1024)
-      local n, err = ffi_call(grpc_client_peek_write, cli.grpc_client, ffi_cast("char*", buf), 1024)
-      if err then
-        ngx.log(ngx.ERR, "failed to peek write buffer: ", err)
-        break
-      end
-      if n > 0 then
-        local data = ffi_str(buf, n)
-        cli.tx_buf:put(data)
-      end
-
-      -- send all bytes from Lua-side buffer
-      if #cli.tx_buf > 0 then
-        local data = cli.tx_buf:get()
-        local sent, err = sock:send(data)
-        if not sent and err == "closed" then
-          ngx.log(ngx.ERR, "failed to send data: ", err)
-          break
-        end
-
-        if sent > 0 then
-          cli.tx_buf:reset()
-          if sent < #data then
-            ngx.log(ngx.INFO, "partial send: ", sent, " of ", #data)
-            local remaining = data:sub(sent + 1)
-            cli.tx_buf:put(remaining)
-          end
-        end
-      end
-      sleep(0)
-    end
-
-    cli:close()
-  end)
-
+  -- start read event loop
   cli.read_evloop = ngx.thread.spawn(function()
     while not is_exiting() do
       if cli.closed then
@@ -371,15 +360,20 @@ function _M.client_streaming(self, service, method, request)
   return json_decode(reply)
 end
 
-function _M.streaming(self, service, method, request, on_message)
+function _M.streaming(self, service, method, request, on_message, opts)
   if self.closed then
     return "grpc client is closed"
   end
 
+  local replies = {}
   local done = false
   local on_reply_cb = ffi_cast("grpc_client_on_reply", function(ptr, n)
-    local reply = ffi_str(ptr, n)
-    on_message(json_decode(reply))
+    local reply_str = ffi_str(ptr, n)
+    if (opts and opts.sync_mode) then
+      table_insert(replies, json_decode(reply_str))
+    else
+      on_message(json_decode(reply_str))
+    end
   end)
   local on_done_cb = ffi_cast("grpc_client_on_done", function() done = true end)
   local _, err = ffi_call(grpc_client_streaming, self.grpc_client, service, method, request:build(), on_reply_cb,
@@ -387,9 +381,26 @@ function _M.streaming(self, service, method, request, on_message)
   if err then
     return "failed to send streaming request: " .. err
   end
-  while not is_exiting() and not done do
-    ffi_call(grpc_client_drive_once, self.grpc_client)
-    sleep(0)
+
+  if opts and opts.sync_mode then
+    local poll_fn
+    poll_fn = function()
+      while not is_exiting() and not done do
+        if #replies > 0 then
+          local reply = table_remove(replies, 1)
+          return reply, poll_fn
+        end
+        ffi_call(grpc_client_drive_once, self.grpc_client)
+        sleep(0.1)
+      end
+    end
+
+    return nil, poll_fn
+  else
+    while not is_exiting() and not done do
+      ffi_call(grpc_client_drive_once, self.grpc_client)
+      sleep(0)
+    end
   end
 end
 

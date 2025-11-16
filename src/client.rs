@@ -72,8 +72,6 @@ pub struct GrpcClient {
   >,
   /// Read buffer sent from the I/O side to the Rust side
   pub read_buf: Rc<RefCell<Vec<u8>>>,
-  /// Write buffer sent from the Rust side to the I/O side
-  pub write_buf: Rc<RefCell<Vec<u8>>>,
   /// Waker triggered when a readable event occurs on the I/O side
   pub waker: Rc<RefCell<Option<Waker>>>,
   /// Task executor
@@ -84,6 +82,8 @@ pub struct GrpcClient {
   pub authority: String,
   /// Scheme for HTTP/2 requests (e.g., "http" or "https")
   pub scheme: String,
+  /// Callback for socket write events
+  pub on_socket_write_cb: Option<crate::grpc_client_on_reply>,
 }
 
 impl GrpcClient {
