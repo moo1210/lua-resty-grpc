@@ -5,41 +5,32 @@ edition = "2024"
 
 [lib]
 name = "restygrpc"
-crate-type = ["cdylib"]
+crate-type = ["staticlib"]
 path = "src/lib.rs"
 
 [dependencies]
-tonic = { version = "0.14", default-features = false }
-bytes = "1"
-http = "1"
-tokio = { version = "1", default-features = false, features = [
+tonic = { version = "0.14.6", default-features = false }
+bytes = "1.12.1"
+http = "1.5.0"
+tokio = { version = "1.53.1", default-features = false, features = [
   "sync",
   "io-util",
 ] }
-tokio-stream = "0.1.17"
-protobuf = "3.7.2"
-protobuf-parse = "3.7.2"
-protobuf-json-mapping = "3.7.2"
-tower = "0.5.2"
-hyper = "1.7.0"
-h2 = "0.4"
-http-body-util = "0.1"
-http-body = "1"
-log = "0.4"
-ffi-support = { version = "0.4.4", default-features = false }
-
-[build-dependencies]
-cbindgen = "0.29.0"
+tokio-stream = { version = "0.1.19", default-features = false }
+tower = "0.5.3"
+hyper = "1.11.1"
+h2 = "0.4.19"
+http-body-util = "0.1.5"
+http-body = "1.1.0"
+log = "0.4.34"
 
 [profile.release]
 opt-level = "s"
 debug = false
-#split-debuginfo = 'packed'
-#strip = "symbols"
 debug-assertions = false
 overflow-checks = false
-lto = false
+lto = true
+codegen-units = 1
 panic = 'unwind'
 incremental = false
-codegen-units = 16
 rpath = false

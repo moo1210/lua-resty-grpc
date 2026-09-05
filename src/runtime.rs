@@ -6,6 +6,19 @@ use std::{
   task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
+/// Budget every `drive_once` call site passes. `drive_once` already
+/// returns (via its `None => break` on an empty ready queue) as soon as
+/// there's nothing left to poll, so this is a ceiling for a pathological
+/// self-waking loop, not a throttle real workloads ever hit: even a
+/// connection at its stream cap (`DEFAULT_MAX_CONCURRENT_STREAMS` in
+/// pool.rs, 100 by default) waking every one of its calls at once is two
+/// orders of magnitude under this. Callers never recheck `drive_once`'s
+/// return value to call it again, so this budget must stay comfortably
+/// above the largest burst of tasks any single wake can produce, or the
+/// excess is left stranded in the queue until an unrelated event drains
+/// it.
+pub const DRIVE_BUDGET: usize = 10_000;
+
 struct Task {
   fut: Pin<Box<dyn Future<Output = ()> + 'static>>,
   queued: bool,
@@ -14,6 +27,11 @@ struct Task {
 struct ReactorInner {
   tasks: Vec<Option<Task>>,
   ready: VecDeque<usize>,
+  /// Slots left `None` by a task that ran to completion, reused by the
+  /// next `spawn` instead of growing `tasks` forever. A long-lived
+  /// worker driving thousands of calls over its lifetime would
+  /// otherwise accumulate a `tasks` vec that never shrinks.
+  free: Vec<usize>,
 }
 
 /// Lightweight single-step task executor
@@ -35,9 +53,13 @@ impl Reactor {
   {
     let mut inner = self.inner.borrow_mut();
 
-    // Always append a new slot to avoid clobbering a task currently being polled (whose slot is temporarily None)
-    inner.tasks.push(None);
-    let id = inner.tasks.len() - 1;
+    let id = match inner.free.pop() {
+      Some(id) => id,
+      None => {
+        inner.tasks.push(None);
+        inner.tasks.len() - 1
+      }
+    };
     inner.tasks[id] = Some(Task {
       fut: Box::pin(fut),
       queued: false,
@@ -48,26 +70,6 @@ impl Reactor {
       id,
       inner.ready.len()
     );
-  }
-
-  /// Wake up suspended tasks and add them to the ready queue
-  pub fn poke_all(&self) {
-    let mut inner = self.inner.borrow_mut();
-    let mut to_queue: Vec<usize> = Vec::new();
-    for (id, slot) in inner.tasks.iter_mut().enumerate() {
-      if let Some(task) = slot.as_mut()
-        && !task.queued
-      {
-        task.queued = true;
-        to_queue.push(id);
-      }
-    }
-    for id in &to_queue {
-      inner.ready.push_back(*id);
-    }
-    if !to_queue.is_empty() {
-      log::trace!("Reactor.poke_all queued tasks: {:?}", to_queue);
-    }
   }
 
   /// Construct a waker to wake up suspended tasks
@@ -133,7 +135,10 @@ impl Reactor {
       let waker = Self::make_waker(id, self.inner.clone());
       let mut cx = Context::from_waker(&waker);
       match task.fut.as_mut().poll(&mut cx) {
-        Poll::Ready(()) => {}
+        Poll::Ready(()) => {
+          let mut inner = self.inner.borrow_mut();
+          inner.free.push(id);
+        }
         Poll::Pending => {
           let mut inner = self.inner.borrow_mut();
           inner.tasks[id] = Some(task);
@@ -144,4 +149,18 @@ impl Reactor {
     let inner = self.inner.borrow();
     !inner.ready.is_empty()
   }
+}
+
+thread_local! {
+  /// One `Reactor` per worker, not one per client or connection.
+  /// nginx's own event loop drives everything, so every connection's
+  /// event handlers and every one-shot timer in this crate wake into
+  /// the same executor regardless of which call or pool entry they
+  /// belong to. A pooled h2 connection shared across multiple calls
+  /// has no single client to belong to anyway.
+  static WORKER_REACTOR: Reactor = Reactor::new();
+}
+
+pub fn worker_reactor() -> Reactor {
+  WORKER_REACTOR.with(|r| r.clone())
 }

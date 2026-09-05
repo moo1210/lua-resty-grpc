@@ -1,659 +1,359 @@
-use bytes::Bytes;
+//! FFI surface for `lualib/resty/grpc.lua`.
+//!
+//! This is a synchronous, non-blocking API: Lua starts a call, then
+//! blocks the calling coroutine on an `ngx.semaphore` (`sem:wait()`, a
+//! real yield, not a poll loop) until Rust posts it from whatever
+//! nginx event handler produced the next message or the final status.
+//! The worker process itself is never blocked; other coroutines keep
+//! running on nginx's event loop in the meantime. See
+//! `client::CallState::push` and `ngx::lua_sema_post`. There is no
+//! callback surface here at all.
+//!
+//! Every payload here is raw bytes (protobuf, already encoded/decoded by
+//! Lua via lua-protobuf). Rust never parses a message; it only frames
+//! it (`codec::BytesCodec`) and moves it.
+
 use std::{
   cell::RefCell,
-  collections::HashMap,
-  ffi::{CString, c_char},
-  path::Path,
-  rc::Rc,
+  ffi::{CString, c_char, c_void},
 };
-use tokio_stream::StreamExt;
 
 mod client;
 mod codec;
+mod ffi;
+mod handle;
+mod ngx;
+mod pool;
 mod runtime;
 mod transport;
 
-/// Handle to a gRPC client instance
+use ffi::{FfiStr, call_with_result, err};
+use handle::{HandleError, HandleMap};
+
 #[allow(non_camel_case_types)]
 pub type grpc_client_handle = u64;
-
-/// Handle to a streaming request instance
-/// Used for client-side and bidirectional streaming operations
 #[allow(non_camel_case_types)]
-pub type grpc_client_streaming_request_handle = u64;
-
-/// Callback function type for handling gRPC streaming response done
+pub type grpc_call_handle = u64;
 #[allow(non_camel_case_types)]
-pub type grpc_client_on_done = unsafe extern "C" fn();
-
-/// Callback function type for handling gRPC response messages
-#[allow(non_camel_case_types)]
-pub type grpc_client_on_reply = unsafe extern "C" fn(*const c_char, usize);
-
-#[allow(non_camel_case_types)]
-pub type grpc_client_error = ffi_support::ExternError;
+pub type grpc_error = ffi::GrpcError;
 
 thread_local! {
-  static GRPC_CLIENT_HANDLES: RefCell<ffi_support::HandleMap<client::GrpcClient>> = RefCell::new(ffi_support::HandleMap::new());
-  static GRPC_STREAMING_REQUEST_HANDLES: RefCell<ffi_support::HandleMap<client::GrpcStreamingRequest>> = RefCell::new(ffi_support::HandleMap::new());
+  static CLIENTS: RefCell<HandleMap<client::GrpcClient>> = RefCell::new(HandleMap::new());
+  static CALLS: RefCell<HandleMap<client::GrpcCall>> = RefCell::new(HandleMap::new());
+}
+
+/// # Safety
+/// `ptr` must be valid for `len` bytes, or `len == 0`, in which case
+/// `ptr` may be null or dangling, for the duration of this call. The
+/// bytes are copied out immediately; nothing here retains `ptr` itself
+/// past this function.
+unsafe fn bytes_from_raw(ptr: *const u8, len: usize) -> bytes::Bytes {
+  if len == 0 || ptr.is_null() {
+    return bytes::Bytes::new();
+  }
+  bytes::Bytes::copy_from_slice(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn grpc_client_version() -> *const c_char {
-  CString::new(env!("CARGO_PKG_VERSION")).unwrap().into_raw()
+  // Intentionally never freed: this is a static string for the
+  // lifetime of the process, called at most once at module load.
+  static VERSION: std::sync::OnceLock<CString> = std::sync::OnceLock::new();
+  VERSION
+    .get_or_init(|| CString::new(env!("CARGO_PKG_VERSION")).unwrap())
+    .as_ptr()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_streaming_request_new(
-  client_handle: grpc_client_handle,
-  service: ffi_support::FfiStr,
-  method: ffi_support::FfiStr,
-  err: &mut grpc_client_error,
-) -> grpc_client_streaming_request_handle {
-  ffi_support::call_with_result(
-    err,
-    || -> Result<grpc_client_streaming_request_handle, grpc_client_error> {
-      let client_handle = ffi_support::Handle::from_u64(client_handle)?;
-
-      let service = service.into_opt_string().ok_or_else(|| {
-        grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid service")
-      })?;
-
-      let method = method.into_opt_string().ok_or_else(|| {
-        grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid method")
-      })?;
-
-      GRPC_CLIENT_HANDLES.with(
-        move |m| -> Result<grpc_client_streaming_request_handle, grpc_client_error> {
-          let client_ref = m.borrow();
-          let client = client_ref.get(client_handle)?;
-
-          Ok(GRPC_STREAMING_REQUEST_HANDLES.with(|m| {
-            m.borrow_mut()
-              .insert(client::GrpcStreamingRequest::new(
-                client
-                  .get_method_descriptor(&service, &method)
-                  .unwrap()
-                  .input_type(),
-              ))
-              .into_u64()
-          }))
-        },
-      )
-    },
-  )
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_streaming_request_free(
-  handle: grpc_client_streaming_request_handle,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || -> Result<(), ffi_support::HandleError> {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-    GRPC_STREAMING_REQUEST_HANDLES.with(|m| m.borrow_mut().delete(handle))
-  })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_streaming_request_push(
-  request_handle: grpc_client_streaming_request_handle,
-  data: ffi_support::FfiStr,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || -> Result<(), grpc_client_error> {
-    let request_handle = ffi_support::Handle::from_u64(request_handle)?;
-
-    let data = data.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid data")
-    })?;
-
-    GRPC_STREAMING_REQUEST_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      let mut request_ref = m.borrow_mut();
-      let request = request_ref.get_mut(request_handle)?;
-
-      let message =
-        protobuf_json_mapping::parse_dyn_from_str(request.get_message_descriptor(), &data).unwrap();
-      let _ = request.send(message);
-      Ok(())
-    })
-  })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_streaming_request_done(
-  request_handle: grpc_client_streaming_request_handle,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || -> Result<(), grpc_client_error> {
-    let request_handle = ffi_support::Handle::from_u64(request_handle)?;
-
-    GRPC_STREAMING_REQUEST_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      m.borrow_mut().get_mut(request_handle)?.done();
-      Ok(())
-    })
-  })
-}
-
+/// Creates a client bound to one endpoint. `sni` may be an empty string
+/// (meaning "no SNI" / not applicable for plaintext).
+///
+/// # Safety
+/// `addr`/`scheme`/`sni` must be valid `FfiStr`s for the call's
+/// duration.
 #[unsafe(no_mangle)]
 pub extern "C" fn grpc_client_new(
-  authority: ffi_support::FfiStr,
-  scheme: ffi_support::FfiStr,
-  err: &mut grpc_client_error,
+  addr: FfiStr,
+  scheme: FfiStr,
+  sni: FfiStr,
+  out_err: &mut grpc_error,
 ) -> grpc_client_handle {
-  ffi_support::call_with_result(err, || -> Result<u64, grpc_client_error> {
-    let authority = authority.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid authority")
-    })?;
+  call_with_result(out_err, || -> Result<u64, grpc_error> {
+    let addr = addr.into_opt_string().ok_or_else(|| err("invalid addr"))?;
+    let scheme = scheme
+      .into_opt_string()
+      .ok_or_else(|| err("invalid scheme"))?;
+    let sni = sni.into_opt_string().filter(|s| !s.is_empty());
 
-    let scheme = scheme.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid scheme")
-    })?;
+    let tls = match scheme.as_str() {
+      "http" => false,
+      "https" => true,
+      other => return Err(err(format!("unsupported scheme {other:?}"))),
+    };
 
-    Ok(GRPC_CLIENT_HANDLES.with(|m| {
-      m.borrow_mut()
-        .insert(client::GrpcClient {
-          descriptors: HashMap::new(),
-          read_buf: Rc::new(RefCell::new(Vec::new())),
-          waker: Rc::new(RefCell::new(None)),
-          reactor: runtime::Reactor::new(),
-          h2_sender: Rc::new(RefCell::new(None)),
-          authority,
-          scheme,
-          on_socket_write_cb: None,
-        })
-        .into_u64()
-    }))
+    let key = pool::EndpointKey { addr, tls, sni };
+    Ok(CLIENTS.with(|m| m.borrow_mut().insert(client::GrpcClient::new(key))))
   })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_free(handle: grpc_client_handle, err: &mut grpc_client_error) {
-  ffi_support::call_with_result(err, || -> Result<(), ffi_support::HandleError> {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-    GRPC_CLIENT_HANDLES.with(|m| m.borrow_mut().delete(handle))
+pub extern "C" fn grpc_client_free(handle: grpc_client_handle, out_err: &mut grpc_error) {
+  call_with_result(out_err, || -> Result<(), HandleError> {
+    CLIENTS.with(|m| m.borrow_mut().delete(handle))
+  });
+}
+
+fn insert_call(
+  state: std::rc::Rc<client::CallState>,
+  outbound: Option<tokio::sync::mpsc::Sender<bytes::Bytes>>,
+) -> u64 {
+  CALLS.with(|m| {
+    m.borrow_mut()
+      .insert(client::GrpcCall::new(state, outbound))
+  })
+}
+
+/// Starts a unary call.
+///
+/// # Safety
+/// `path` must be a valid `FfiStr`. `body_ptr`/`body_len` must describe
+/// a valid (possibly zero-length) byte buffer for the call's duration.
+/// `sem` is an opaque pointer Lua's `ngx.semaphore` FFI binding produced
+/// (never dereferenced here, only forwarded to `ngx_grpc_lua_sema_post`);
+/// it must stay valid until the call completes and is polled to
+/// completion or freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grpc_call_unary(
+  client_handle: grpc_client_handle,
+  path: FfiStr,
+  body_ptr: *const u8,
+  body_len: usize,
+  sem: *mut c_void,
+  is_stream_subsys: u8,
+  out_err: &mut grpc_error,
+) -> grpc_call_handle {
+  call_with_result(out_err, || -> Result<u64, grpc_error> {
+    let path = path.into_opt_string().ok_or_else(|| err("invalid path"))?;
+    let body = unsafe { bytes_from_raw(body_ptr, body_len) };
+
+    CLIENTS.with(|m| -> Result<u64, grpc_error> {
+      let clients = m.borrow();
+      let client = clients.get(client_handle)?;
+      let state = client::start_unary(client, path, body, sem, is_stream_subsys != 0);
+      Ok(insert_call(state, None))
+    })
+  })
+}
+
+/// Starts a server-streaming call.
+///
+/// # Safety
+/// Same contract as [`grpc_call_unary`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grpc_call_server_streaming(
+  client_handle: grpc_client_handle,
+  path: FfiStr,
+  body_ptr: *const u8,
+  body_len: usize,
+  sem: *mut c_void,
+  is_stream_subsys: u8,
+  out_err: &mut grpc_error,
+) -> grpc_call_handle {
+  call_with_result(out_err, || -> Result<u64, grpc_error> {
+    let path = path.into_opt_string().ok_or_else(|| err("invalid path"))?;
+    let body = unsafe { bytes_from_raw(body_ptr, body_len) };
+
+    CLIENTS.with(|m| -> Result<u64, grpc_error> {
+      let clients = m.borrow();
+      let client = clients.get(client_handle)?;
+      let state = client::start_server_streaming(client, path, body, sem, is_stream_subsys != 0);
+      Ok(insert_call(state, None))
+    })
+  })
+}
+
+/// Starts a client-streaming call. Request messages are fed in
+/// afterwards via [`grpc_call_send`], terminated by [`grpc_call_done`].
+///
+/// # Safety
+/// `path` must be a valid `FfiStr`; `sem` per [`grpc_call_unary`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grpc_call_client_streaming(
+  client_handle: grpc_client_handle,
+  path: FfiStr,
+  sem: *mut c_void,
+  is_stream_subsys: u8,
+  out_err: &mut grpc_error,
+) -> grpc_call_handle {
+  call_with_result(out_err, || -> Result<u64, grpc_error> {
+    let path = path.into_opt_string().ok_or_else(|| err("invalid path"))?;
+
+    CLIENTS.with(|m| -> Result<u64, grpc_error> {
+      let clients = m.borrow();
+      let client = clients.get(client_handle)?;
+      let (state, tx) = client::start_client_streaming(client, path, sem, is_stream_subsys != 0);
+      Ok(insert_call(state, Some(tx)))
+    })
+  })
+}
+
+/// Starts a bidirectional-streaming call. Same shape as
+/// [`grpc_call_client_streaming`], except responses stream back too.
+///
+/// # Safety
+/// Same as [`grpc_call_client_streaming`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grpc_call_streaming(
+  client_handle: grpc_client_handle,
+  path: FfiStr,
+  sem: *mut c_void,
+  is_stream_subsys: u8,
+  out_err: &mut grpc_error,
+) -> grpc_call_handle {
+  call_with_result(out_err, || -> Result<u64, grpc_error> {
+    let path = path.into_opt_string().ok_or_else(|| err("invalid path"))?;
+
+    CLIENTS.with(|m| -> Result<u64, grpc_error> {
+      let clients = m.borrow();
+      let client = clients.get(client_handle)?;
+      let (state, tx) = client::start_streaming(client, path, sem, is_stream_subsys != 0);
+      Ok(insert_call(state, Some(tx)))
+    })
+  })
+}
+
+/// Pushes one request message on a client-streaming/bidi call. A call
+/// with no `outbound` sink (unary/server-streaming) silently ignores
+/// this. Lua's wrapper is expected to never call it for those, but a
+/// hard error here would just be one more thing to handle for no
+/// benefit.
+///
+/// # Safety
+/// `body_ptr`/`body_len` per [`grpc_call_unary`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grpc_call_send(
+  handle: grpc_call_handle,
+  body_ptr: *const u8,
+  body_len: usize,
+  out_err: &mut grpc_error,
+) {
+  call_with_result(out_err, || -> Result<(), HandleError> {
+    let body = unsafe { bytes_from_raw(body_ptr, body_len) };
+    CALLS.with(|m| -> Result<(), HandleError> {
+      let calls = m.borrow();
+      let call = calls.get(handle)?;
+      if let Some(tx) = call.outbound.borrow().as_ref() {
+        // Backpressure/closed-channel errors surface to Lua through the
+        // eventual Done event (the driver task's `send_request`/stream
+        // will itself fail and produce a status), not here.
+        let _ = tx.try_send(body);
+      }
+      Ok(())
+    })
+  });
+  // `try_send` only wakes the task reading this channel. Nothing else
+  // polls it afterward, so it must be driven explicitly here, the same
+  // as every nginx event handler in this crate.
+  runtime::worker_reactor().drive_once(runtime::DRIVE_BUDGET);
+}
+
+/// Signals no more request messages on a client-streaming/bidi call.
+#[unsafe(no_mangle)]
+pub extern "C" fn grpc_call_done(handle: grpc_call_handle, out_err: &mut grpc_error) {
+  call_with_result(out_err, || -> Result<(), HandleError> {
+    CALLS.with(|m| -> Result<(), HandleError> {
+      let calls = m.borrow();
+      let call = calls.get(handle)?;
+      // Dropping the sender ends the ReceiverStream the driver task is
+      // reading from.
+      *call.outbound.borrow_mut() = None;
+      Ok(())
+    })
+  });
+  runtime::worker_reactor().drive_once(runtime::DRIVE_BUDGET);
+}
+
+/// Cooperative cancellation. See `CallState::cancelled`. Meant to be
+/// called from Lua's `ngx.on_abort` handler when the client disconnects
+/// mid-call.
+#[unsafe(no_mangle)]
+pub extern "C" fn grpc_call_cancel(handle: grpc_call_handle, out_err: &mut grpc_error) {
+  call_with_result(out_err, || -> Result<(), HandleError> {
+    CALLS.with(|m| -> Result<(), HandleError> {
+      let calls = m.borrow();
+      calls.get(handle)?.state.cancel();
+      Ok(())
+    })
   });
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_set_on_socket_write_cb(
-  handle: grpc_client_handle,
-  on_socket_write_cb: grpc_client_on_reply,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-    GRPC_CLIENT_HANDLES.with(|m| -> Result<(), grpc_client_error> {
-      m.borrow_mut().get_mut(handle)?.on_socket_write_cb = Some(on_socket_write_cb);
-      Ok(())
-    })
-  })
+pub extern "C" fn grpc_call_free(handle: grpc_call_handle, out_err: &mut grpc_error) {
+  call_with_result(out_err, || -> Result<(), HandleError> {
+    // `GrpcCall::drop` cancels the driver task cooperatively.
+    CALLS.with(|m| m.borrow_mut().delete(handle))
+  });
 }
 
+/// Poll result tags, mirrored in `lualib/resty/grpc.lua`.
+const GRPC_POLL_PENDING: u8 = 0;
+const GRPC_POLL_MESSAGE: u8 = 1;
+const GRPC_POLL_DONE: u8 = 2;
+
+/// Drains one pending event. Lua calls this after `sem:wait()` returns
+/// (and in a loop until it returns `GRPC_POLL_PENDING` again, since one
+/// `sem:post()` only guarantees "at least one new event", not exactly
+/// one).
+///
+/// On `GRPC_POLL_MESSAGE`, `*out_msg_ptr`/`*out_msg_len` describe the
+/// message bytes. On `GRPC_POLL_DONE`, `*out_status_code` is the gRPC
+/// status code (0 = OK) and `*out_status_msg_ptr`/`*out_status_msg_len`
+/// describe the status message (possibly zero-length). Every out-buffer
+/// is owned by the call and only valid until the next `grpc_call_poll`
+/// on the same handle. Lua must copy it out (`ffi.string`) before
+/// calling this again.
+///
+/// # Safety
+/// All four `out_*` pointers must be valid, aligned, writable pointers
+/// of their respective types.
 #[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_load_proto_file(
-  handle: grpc_client_handle,
-  proto_path: ffi_support::FfiStr,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || -> Result<(), grpc_client_error> {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    let path = proto_path.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid proto path")
-    })?;
-
-    let path_parent = Path::new(&path).parent().ok_or_else(|| {
-      grpc_client_error::new_error(
-        ffi_support::ErrorCode::new(1),
-        "Failed to get parent directory of proto path",
-      )
-    })?;
-
-    let file_descriptor_protos = protobuf_parse::Parser::new()
-      .pure()
-      .include(path_parent)
-      .input(path)
-      .parse_and_typecheck()
-      .map_err(|e| {
-        grpc_client_error::new_error(
-          ffi_support::ErrorCode::new(1),
-          format!("failed to parse proto file: {}", e),
-        )
-      })?
-      .file_descriptors;
-
-    let fd = protobuf::reflect::FileDescriptor::new_dynamic(
-      file_descriptor_protos.into_iter().next().unwrap(),
-      &[],
-    )
-    .map_err(|e| {
-      grpc_client_error::new_error(
-        ffi_support::ErrorCode::new(1),
-        format!("failed to create file descriptor: {}", e),
-      )
-    })?;
-
-    GRPC_CLIENT_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      m.borrow_mut().get_mut(handle)?.add_service_and_method(fd);
-      Ok(())
-    })
-  })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_loaded_protos(
-  handle: grpc_client_handle,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    GRPC_CLIENT_HANDLES.with(|m| -> Result<(), grpc_client_error> {
-      let client_ref = m.borrow();
-      let client = client_ref.get(handle)?;
-      log::debug!(
-        "grpc_client_loaded_protos loaded services: {:?}",
-        client.descriptors.keys()
-      );
-      Ok(())
-    })
-  })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_connect(handle: grpc_client_handle, err: &mut grpc_client_error) {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    GRPC_CLIENT_HANDLES.with(|m| -> Result<(), grpc_client_error> {
-      let mut client_ref = m.borrow_mut();
-      let client = client_ref.get_mut(handle)?;
-      let read_buf = client.read_buf.clone();
-      let waker = client.waker.clone();
-      let reactor_for_spawn = client.reactor.clone();
-      let reactor_for_drive = reactor_for_spawn.clone();
-      let sender_cell = client.h2_sender.clone();
-      let on_socket_write_cb = client.on_socket_write_cb;
-
-      if on_socket_write_cb.is_none() {
-        return Err(grpc_client_error::new_error(
-          ffi_support::ErrorCode::new(1),
-          "on_socket_write_cb is not set",
-        ));
-      }
-
-      reactor_for_spawn.spawn(async move {
-        let io = transport::memory_shim::MemoryShim {
-          read_buf,
-          waker,
-          on_socket_write_cb: on_socket_write_cb.unwrap(),
-        };
-        match h2::client::handshake(io).await {
-          Ok((send_request, connection)) => {
-            log::debug!("h2 handshake OK; storing sender");
-            let drive = async move {
-              if let Err(e) = connection.await {
-                log::error!("h2 connection error: {:?}", e);
-              } else {
-                log::debug!("h2 connection closed cleanly");
-              }
-            };
-            *sender_cell.borrow_mut() = Some(send_request);
-            reactor_for_drive.spawn(drive);
-          }
-          Err(e) => {
-            log::error!("h2 handshake error: {:?}", e);
-          }
-        }
-      });
-      client.reactor.drive_once(64);
-      Ok(())
-    })
-  })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_on_receive(
-  handle: grpc_client_handle,
-  data: *const c_char,
-  n: usize,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    GRPC_CLIENT_HANDLES.with(|m| -> Result<(), grpc_client_error> {
-      let mut client_ref = m.borrow_mut();
-      let client = client_ref.get_mut(handle)?;
-      let read_buf = client.read_buf.clone();
-      let waker = client.waker.clone();
-      let mut b = read_buf.borrow_mut();
-      unsafe {
-        let bytes = std::slice::from_raw_parts(data as *const u8, n);
-        b.extend_from_slice(bytes);
-      }
-      if let Some(w) = waker.borrow_mut().take() {
-        w.wake();
-      }
-      client.reactor.poke_all();
-      Ok(())
-    })
-  })
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn grpc_client_drive_once(
-  handle: grpc_client_handle,
-  err: &mut grpc_client_error,
+pub unsafe extern "C" fn grpc_call_poll(
+  handle: grpc_call_handle,
+  out_msg_ptr: *mut *const u8,
+  out_msg_len: *mut usize,
+  out_status_code: *mut i32,
+  out_status_msg_ptr: *mut *const u8,
+  out_status_msg_len: *mut usize,
+  out_err: &mut grpc_error,
 ) -> u8 {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
+  call_with_result(out_err, || -> Result<u8, HandleError> {
+    CALLS.with(|m| -> Result<u8, HandleError> {
+      let calls = m.borrow();
+      let call = calls.get(handle)?;
 
-    GRPC_CLIENT_HANDLES.with(|m| -> Result<bool, ffi_support::HandleError> {
-      let mut client_ref = m.borrow_mut();
-      let client = client_ref.get_mut(handle)?;
-      client.reactor.poke_all();
-      Ok(client.reactor.drive_once(64))
-    })
-  })
-}
-
-/// Send a unary request
-/// # Safety
-/// The callback is passed using the unsafe function. Ensure that you pass in a valid function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn grpc_client_unary(
-  handle: grpc_client_handle,
-  service: ffi_support::FfiStr,
-  method: ffi_support::FfiStr,
-  data: ffi_support::FfiStr,
-  on_reply_cb: grpc_client_on_reply,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    let service = service.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid service")
-    })?;
-
-    let method = method.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid method")
-    })?;
-
-    let data = data.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid data")
-    })?;
-
-    GRPC_CLIENT_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      let client_ref = m.borrow();
-      let client = client_ref.get(handle)?;
-
-      let md = client
-        .get_method_descriptor(&service, &method)
-        .ok_or_else(|| {
-          grpc_client_error::new_error(
-            ffi_support::ErrorCode::new(1),
-            "failed to get method descriptor",
-          )
-        })?;
-
-      let mut grpc = client.create_tonic_client();
-      let path = client.build_request_path(&service, &method).unwrap();
-      let req_bytes = {
-        let msg = protobuf_json_mapping::parse_dyn_from_str(&md.input_type(), &data)
-          .unwrap()
-          .write_to_bytes_dyn()
-          .unwrap();
-        Bytes::from(msg)
-      };
-
-      let reactor = client.reactor.clone();
-      reactor.spawn(async move {
-        match grpc
-          .unary(
-            tonic::Request::new(req_bytes),
-            path,
-            codec::MyCodec::new(md),
-          )
-          .await
-        {
-          Ok(resp) => {
-            let json = protobuf_json_mapping::print_to_string(resp.into_inner().as_ref()).unwrap();
-            if let Ok(cstr) = CString::new(json) {
-              unsafe { on_reply_cb(cstr.as_ptr(), cstr.count_bytes()) };
-            }
+      match call.state.poll() {
+        None => Ok(GRPC_POLL_PENDING),
+        Some(client::PollResult::Message) => {
+          let msg = call.state.last_message();
+          let msg = msg.as_ref().expect("poll() just set last_message");
+          unsafe {
+            *out_msg_ptr = msg.as_ptr();
+            *out_msg_len = msg.len();
           }
-          Err(status) => {
-            log::error!("tonic status error: {:?}", status);
-          }
+          Ok(GRPC_POLL_MESSAGE)
         }
-      });
-      reactor.drive_once(64);
-      Ok(())
-    })
-  })
-}
-
-/// Send a server-side streaming request
-/// # Safety
-/// The callback is passed using the unsafe function. Ensure that you pass in a valid function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn grpc_client_server_streaming(
-  handle: grpc_client_handle,
-  service: ffi_support::FfiStr,
-  method: ffi_support::FfiStr,
-  data: ffi_support::FfiStr,
-  on_reply_cb: grpc_client_on_reply,
-  on_done_cb: grpc_client_on_done,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let handle = ffi_support::Handle::from_u64(handle)?;
-
-    let service = service.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid service")
-    })?;
-
-    let method = method.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid method")
-    })?;
-
-    let data = data.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid data")
-    })?;
-
-    GRPC_CLIENT_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      let client_ref = m.borrow();
-      let client = client_ref.get(handle)?;
-
-      let md = client
-        .get_method_descriptor(&service, &method)
-        .ok_or_else(|| {
-          grpc_client_error::new_error(
-            ffi_support::ErrorCode::new(1),
-            "failed to get method descriptor",
-          )
-        })?;
-
-      let mut grpc = client.create_tonic_client();
-      let path = client.build_request_path(&service, &method).unwrap();
-      let req_bytes = {
-        let msg = protobuf_json_mapping::parse_dyn_from_str(&md.input_type(), &data)
-          .unwrap()
-          .write_to_bytes_dyn()
-          .unwrap();
-        Bytes::from(msg)
-      };
-
-      let reactor = client.reactor.clone();
-      reactor.spawn(async move {
-        match grpc
-          .server_streaming(
-            tonic::Request::new(req_bytes),
-            path,
-            codec::MyCodec::new(md),
-          )
-          .await
-        {
-          Ok(resp) => {
-            let mut stream = resp.into_inner();
-            while let Some(item) = stream.next().await {
-              let json = protobuf_json_mapping::print_to_string(item.unwrap().as_ref()).unwrap();
-              if let Ok(cstr) = CString::new(json) {
-                unsafe { on_reply_cb(cstr.as_ptr(), cstr.count_bytes()) };
-              }
-            }
-            unsafe { on_done_cb() };
+        Some(client::PollResult::Done(code)) => {
+          let status_msg = call.state.last_status_message();
+          let status_msg = status_msg
+            .as_ref()
+            .expect("poll() just set last_status_message");
+          unsafe {
+            *out_status_code = code;
+            *out_status_msg_ptr = status_msg.as_ptr();
+            *out_status_msg_len = status_msg.len();
           }
-          Err(status) => {
-            log::error!("tonic status error: {:?}", status);
-          }
+          Ok(GRPC_POLL_DONE)
         }
-      });
-      reactor.drive_once(64);
-      Ok(())
-    })
-  })
-}
-
-/// Send a client-side streaming request
-/// # Safety
-/// The callback is passed using the unsafe function. Ensure that you pass in a valid function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn grpc_client_client_streaming(
-  client_handle: grpc_client_handle,
-  service: ffi_support::FfiStr,
-  method: ffi_support::FfiStr,
-  request_handle: grpc_client_streaming_request_handle,
-  on_reply_cb: grpc_client_on_reply,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let client_handle = ffi_support::Handle::from_u64(client_handle)?;
-
-    let service = service.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid service")
-    })?;
-
-    let method = method.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid method")
-    })?;
-
-    GRPC_CLIENT_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      let client_ref = m.borrow();
-      let client = client_ref.get(client_handle)?;
-
-      let md = client
-        .get_method_descriptor(&service, &method)
-        .ok_or_else(|| {
-          grpc_client_error::new_error(
-            ffi_support::ErrorCode::new(1),
-            "failed to get method descriptor",
-          )
-        })?;
-
-      let mut grpc = client.create_tonic_client();
-      let path = client.build_request_path(&service, &method).unwrap();
-
-      let request = GRPC_STREAMING_REQUEST_HANDLES.with(|m| {
-        let handle = ffi_support::Handle::from_u64(request_handle).unwrap();
-        let mut map = m.borrow_mut();
-        let req = map.get_mut(handle).unwrap();
-        req.take_stream()
-      });
-
-      let reactor = client.reactor.clone();
-      reactor.spawn(async move {
-        match grpc
-          .client_streaming(tonic::Request::new(request), path, codec::MyCodec::new(md))
-          .await
-        {
-          Ok(resp) => {
-            let json = protobuf_json_mapping::print_to_string(resp.into_inner().as_ref()).unwrap();
-            if let Ok(cstr) = CString::new(json) {
-              unsafe { on_reply_cb(cstr.as_ptr(), cstr.count_bytes()) };
-            }
-          }
-          Err(status) => {
-            log::error!("tonic status error: {:?}", status);
-          }
-        }
-      });
-      reactor.drive_once(64);
-      Ok(())
-    })
-  })
-}
-
-/// Send a bidirectional streaming request
-/// # Safety
-/// The callback is passed using the unsafe function. Ensure that you pass in a valid function.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn grpc_client_streaming(
-  client_handle: grpc_client_handle,
-  service: ffi_support::FfiStr,
-  method: ffi_support::FfiStr,
-  request_handle: grpc_client_streaming_request_handle,
-  on_reply_cb: grpc_client_on_reply,
-  on_done_cb: grpc_client_on_done,
-  err: &mut grpc_client_error,
-) {
-  ffi_support::call_with_result(err, || {
-    let client_handle = ffi_support::Handle::from_u64(client_handle)?;
-
-    let service = service.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid service")
-    })?;
-
-    let method = method.into_opt_string().ok_or_else(|| {
-      grpc_client_error::new_error(ffi_support::ErrorCode::new(1), "invalid method")
-    })?;
-
-    GRPC_CLIENT_HANDLES.with(move |m| -> Result<(), grpc_client_error> {
-      let client_ref = m.borrow();
-      let client = client_ref.get(client_handle)?;
-
-      let md = client
-        .get_method_descriptor(&service, &method)
-        .ok_or_else(|| {
-          grpc_client_error::new_error(
-            ffi_support::ErrorCode::new(1),
-            "failed to get method descriptor",
-          )
-        })?;
-
-      let mut grpc = client.create_tonic_client();
-      let path = client.build_request_path(&service, &method).unwrap();
-
-      let request = GRPC_STREAMING_REQUEST_HANDLES.with(|m| {
-        let handle = ffi_support::Handle::from_u64(request_handle).unwrap();
-        let mut map = m.borrow_mut();
-        let req = map.get_mut(handle).unwrap();
-        tonic::Request::new(req.take_stream())
-      });
-
-      let reactor = client.reactor.clone();
-      reactor.spawn(async move {
-        match grpc.streaming(request, path, codec::MyCodec::new(md)).await {
-          Ok(resp) => {
-            let mut stream = resp.into_inner();
-            while let Some(item) = stream.next().await {
-              let json = protobuf_json_mapping::print_to_string(item.unwrap().as_ref()).unwrap();
-              if let Ok(cstr) = CString::new(json) {
-                unsafe { on_reply_cb(cstr.as_ptr(), cstr.count_bytes()) };
-              }
-            }
-            unsafe { on_done_cb() };
-          }
-          Err(status) => {
-            log::error!("tonic status error: {:?}", status);
-          }
-        }
-      });
-      reactor.drive_once(64);
-      Ok(())
+      }
     })
   })
 }

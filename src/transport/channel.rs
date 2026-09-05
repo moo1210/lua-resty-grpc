@@ -30,11 +30,12 @@ impl http_body::Body for H2RespBody {
   }
 }
 
-/// Custom tonic Channel implementation
+/// Custom tonic Channel implementation.
 ///
-/// The reason we don't use tonic's built-in channel is that its implementation is tightly coupled with tokio and tower.
-/// Specifically, it uses `tokio::spawn` to start tasks, which is hard-coded and cannot be replaced with my custom executor.
-/// This library does not allow a Rust-side IO event loop, so we cannot use it.
+/// tonic's built-in channel is tightly coupled to tokio and tower: it
+/// uses `tokio::spawn` directly, which cannot be replaced with this
+/// crate's own executor. This crate has no Rust-side IO event loop of
+/// its own, so that built-in channel cannot be used.
 #[derive(Clone)]
 pub struct Channel {
   sender: Rc<RefCell<Option<h2::client::SendRequest<Bytes>>>>,
@@ -105,7 +106,7 @@ impl Channel {
     Ok((h2_req, body))
   }
 
-  /// Send resquest body
+  /// Send the request body
   fn send_body(
     reactor: crate::runtime::Reactor,
     mut body: tonic::body::Body,
@@ -181,8 +182,7 @@ impl tower::Service<hyper::Request<tonic::body::Body>> for Channel {
   type Future =
     Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + 'static>>;
 
-  /// Checke whether the client is ready
-  /// Especially whether HTTP/2 has already completed the handshake
+  /// Ready once the HTTP/2 handshake has completed and a sender exists.
   fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
     if self.sender.borrow().is_some() {
       Poll::Ready(Ok(()))

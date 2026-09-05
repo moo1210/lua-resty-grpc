@@ -1,2 +1,2 @@
 pub mod channel;
-pub mod memory_shim;
+pub mod ngx_io;

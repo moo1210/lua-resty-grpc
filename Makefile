@@ -1,43 +1,44 @@
-UNAME ?= $(shell uname)
-INSTALL ?= install
-ECHO ?= echo
-C_SO_NAME := librestygrpc.so
+# This Makefile builds the Rust crate (target/release/librestygrpc.a)
+# for local iteration: cargo check/clippy/fmt/test against the crate on
+# its own. The nginx module itself is built and linked via nginx's
+# --add-module flow (see `config`):
+#
+#   ./configure --add-module=/path/to/lua-resty-grpc ...
+#   make && make install
+#
+# from an nginx (or openresty) source tree. The `config` script invokes
+# `cargo build --release` itself, so a plain --add-module build does not
+# need this Makefile run first.
+#
+# lualib/resty/grpc.lua is installed alongside the resulting nginx or
+# openresty by whatever assembles the full runtime (e.g.
+# apisix-build-tools), the same way it already does for
+# lua-resty-events.
 
-ifeq ($(UNAME),Darwin)
-	C_SO_NAME := librestygrpc.dylib
-endif
+.PHONY: all
+all: build
 
-all:
-	@echo --- Build
-	@echo CFLAGS: $(CFLAGS)
-	@echo LIBFLAG: $(LIBFLAG)
-	@echo LUA_LIBDIR: $(LUA_LIBDIR)
-	@echo LUA_BINDIR: $(LUA_BINDIR)
-	@echo LUA_INCDIR: $(LUA_INCDIR)
-
-	@echo --- Check Rust toolchain
+.PHONY: build
+build:
 	@utils/check-rust.sh
-	
-	@echo --- Build Rust cdylib
 	cargo build --release
 
-### install:      Install the library to runtime
-.PHONY: install
-install:
-	@echo --- Install
-	@echo INST_PREFIX: $(INST_PREFIX)
-	@echo INST_BINDIR: $(INST_BINDIR)
-	@echo INST_LIBDIR: $(INST_LIBDIR)
-	@echo INST_LUADIR: $(INST_LUADIR)
-	@echo INST_CONFDIR: $(INST_CONFDIR)
-	$(INSTALL) -d $(INST_LUADIR)/resty/ldap/
-	$(INSTALL) lib/resty/*.lua $(INST_LUADIR)/resty/
-	$(INSTALL) target/release/${C_SO_NAME} $(INST_LIBDIR)/${C_SO_NAME}
+.PHONY: check
+check:
+	cargo fmt --check
+	cargo clippy --release -- -D warnings
 
-### dev:          Create a development ENV
-.PHONY: dev
-dev:
-	luarocks install rockspec/lua-resty-grpc-main-0.rockspec --only-deps --local
+.PHONY: fmt
+fmt:
+	cargo fmt
+
+.PHONY: test
+test:
+	cargo test --release
+
+.PHONY: clean
+clean:
+	cargo clean
 
 ### help:         Show Makefile rules
 .PHONY: help
@@ -45,6 +46,3 @@ help:
 	@echo Makefile rules:
 	@echo
 	@grep -E '^### [-A-Za-z0-9_]+:' Makefile | sed 's/###/   /'
-
-test:
-	prove -r t/

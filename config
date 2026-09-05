@@ -1,0 +1,41 @@
+###############################################################################
+# nginx --add-module / --add-dynamic-module config script for
+# ngx_grpc_client_module (lua-resty-grpc).
+#
+# Almost all of the module's logic lives in a Rust staticlib
+# (target/release/librestygrpc.a). It is linked in with
+# -Wl,--whole-archive because none of its FFI entry points meant for Lua
+# (the grpc_call_* surface) are referenced from C, so the linker would
+# otherwise drop their object files. This is true for both the static
+# (--add-module) and dynamic (--add-dynamic-module) forms, since both are
+# just linking the same .a into a different final binary.
+###############################################################################
+
+ngx_addon_name=ngx_grpc_client_module
+
+ngx_grpc_rust_lib="$ngx_addon_dir/target/release/librestygrpc.a"
+
+echo "lua-resty-grpc: building Rust static library (release) ..."
+( cd "$ngx_addon_dir" && cargo build --release ) || exit 1
+
+if [ ! -f "$ngx_grpc_rust_lib" ]; then
+    echo "$0: error: cargo build did not produce $ngx_grpc_rust_lib"
+    exit 1
+fi
+
+ngx_grpc_native_libs=`cd "$ngx_addon_dir" \
+    && cargo rustc --release -q -- --print native-static-libs 2>&1 \
+    | sed -n 's/^.*native-static-libs: *//p' | tail -n 1`
+
+if [ -z "$ngx_grpc_native_libs" ]; then
+    echo "$0: warning: could not determine native-static-libs from cargo, falling back to a guess"
+    ngx_grpc_native_libs="-lgcc_s -lutil -lrt -lpthread -lm -ldl -lc"
+fi
+
+ngx_module_type=CORE
+ngx_module_name=ngx_grpc_client_module
+ngx_module_srcs="$ngx_addon_dir/ngx_module/ngx_grpc_module.c $ngx_addon_dir/ngx_module/ngx_grpc_shim.c"
+ngx_module_incs="$ngx_addon_dir/ngx_module"
+ngx_module_libs="-Wl,--whole-archive $ngx_grpc_rust_lib -Wl,--no-whole-archive $ngx_grpc_native_libs"
+
+. auto/module
