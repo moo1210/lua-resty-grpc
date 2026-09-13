@@ -1,0 +1,6 @@
+benchmark/new-patched
+benchmark/build
+benchmark/logs
+benchmark/bin
+benchmark/openresty
+benchmark/run

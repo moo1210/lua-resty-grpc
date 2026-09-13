@@ -1,0 +1,6 @@
+[submodule "new"]
+	path = new
+	url = git@github.com:bzp2010/lua-resty-grpc.git
+[submodule "old"]
+	path = old
+	url = git@github.com:bzp2010/lua-resty-grpc.git

@@ -1,0 +1,27 @@
+--- a/ngx_module/ngx_grpc_shim.c
++++ b/ngx_module/ngx_grpc_shim.c
+@@ ngx_grpc_connect
+   /* NGX_OK or NGX_AGAIN: pc.connection is valid. */
+   c = pc.connection;
+   c->data = NULL;
+   c->pool = ngx_create_pool(512, log);
+   if (c->pool == NULL) {
+     ngx_close_connection(c);
+     return NGX_ERROR;
+   }
+ 
++  /*
++   * gRPC writes the request as several small frames (HEADERS, then DATA).
++   * Without TCP_NODELAY the second small write waits for the first to be
++   * ACKed; against a peer using delayed ACK that is a ~40ms stall on every
++   * request after the first one on a pooled connection.
++   *
++   * Use ngx_tcp_nodelay(c) while c->tcp_nodelay is still UNSET: it sets
++   * TCP_NODELAY and marks the flag itself. (Setting the flag first would
++   * make ngx_tcp_nodelay() return early without calling setsockopt.)
++   */
++  (void) ngx_tcp_nodelay(c);
++
+   *out_c = c;
+   return rc;
+ }
